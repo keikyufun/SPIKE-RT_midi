@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPIKE-RT-MIDI Converter</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+        }
+        input[type="file"] {
+            margin: 10px 0;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        select, textarea {
+            width: 100%;
+            margin: 10px 0;
+            padding: 10px;
+        }
+        #output {
+            background-color: #ecf0f1;
+            border: 1px solid #bdc3c7;
+            min-height: 200px;
+        }
+        .options {
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>SPIKE-RT-MIDI Converter</h1>
+    <p>Upload a MIDI file to convert it to SPIKE RT speaker functions.</p>
+    
+    <input type="file" id="midiFile" accept=".mid,.midi">
+    <button onclick="loadMidi()">Load MIDI File</button>
+    
+    <div id="trackSelect" style="display: none;">
+        <label for="track">Select Track:</label>
+        <select id="track"></select>
+        <button onclick="previewTrack()">Preview Track</button>
+        <button onclick="playTrack()">Play Track</button>
+        <button onclick="convertTrack()">Convert</button>
+        <br>
+        <button onclick="convertAllTracks()">Convert All Tracks</button>
+        <div class="options">
+            <label><input type="checkbox" id="fastMode"> Fast Mode</label>
+            <label><input type="checkbox" id="overwrite"> Overwrite Existing</label>
+        </div>
+    </div>
+    
+    <textarea id="output" readonly placeholder="Converted code will be displayed here"></textarea>
+
+    <script>
+        let midiData = null;
+        let audioContext = null;
+
+        // Web Audio API初期化
+        function initAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+
+        // MIDIノート番号から周波数を計算
+        function midiNoteToFrequency(note) {
+            return 440 * Math.pow(2, (note - 69) / 12);
+        }
+        
+        // 和音を複数パートに分割
+        function separateChords(notes) {
+            if (notes.length === 0) return [];
+            
+            const parts = [];
+            const sortedNotes = [...notes].sort((a, b) => a.startTime - b.startTime);
+            
+            for (const note of sortedNotes) {
+                let assigned = false;
+                for (const part of parts) {
+                    let canAdd = true;
+                    for (const existingNote of part) {
+                        if (!(note.endTime <= existingNote.startTime + 1 || note.startTime >= existingNote.endTime - 1)) {
+                            canAdd = false;
+                            break;
+                        }
+                    }
+                    if (canAdd) {
+                        part.push(note);
+                        assigned = true;
+                        break;
+                    }
+                }
+                
+                if (!assigned) {
+                    parts.push([note]);
+                }
+            }
+            
+            return parts;
+        }
+
+        // ビッグエンディアンからリトルエンディアン
+        function readUint16BE(buffer, offset) {
+            return (buffer[offset] << 8) | buffer[offset + 1];
+        }
+
+        function readUint32BE(buffer, offset) {
+            return (buffer[offset] << 24) | (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3];
+        }
+
+        // 可変長整数読み込み
+        function readVarLen(buffer, offset) {
+            let val = 0;
+            let i = 0;
+            do {
+                val = (val << 7) | (buffer[offset + i] & 0x7F);
+                i++;
+            } while (buffer[offset + i - 1] & 0x80);
+            return { value: val, bytes: i };
+        }
+
+        // MIDIファイルを解析
+        function parseMidi(buffer) {
+            let offset = 0;
+            const header = new TextDecoder().decode(buffer.slice(0, 4));
+            if (header !== 'MThd') {
+                throw new Error('Not a MIDI file');
+            }
+            offset += 4;
+            const headerLength = readUint32BE(buffer, offset);
+            offset += 4;
+            const format = readUint16BE(buffer, offset);
+            offset += 2;
+            const trackCount = readUint16BE(buffer, offset);
+            offset += 2;
+            const division = readUint16BE(buffer, offset);
+            offset += 2;
+
+            const tracks = [];
+            for (let t = 0; t < trackCount; t++) {
+                const trackHeader = new TextDecoder().decode(buffer.slice(offset, offset + 4));
+                if (trackHeader !== 'MTrk') {
+                    throw new Error('Not a track chunk');
+                }
+                offset += 4;
+                const trackLength = readUint32BE(buffer, offset);
+                offset += 4;
+                const trackEnd = offset + trackLength;
+
+                const notes = [];
+                let currentTime = 0;
+                let runningStatus = 0;
+
+                while (offset < trackEnd) {
+                    const deltaResult = readVarLen(buffer, offset);
+                    currentTime += deltaResult.value;
+                    offset += deltaResult.bytes;
+
+                    let status = buffer[offset++];
+                    if (status < 0x80) {
+                        status = runningStatus;
+                        offset--;
+                    } else {
+                        runningStatus = status;
+                    }
+
+                    if ((status & 0xF0) === 0x90) { // ノートオン
+                        const note = buffer[offset++];
+                        const velocity = buffer[offset++];
+                        if (velocity > 0) {
+                            notes.push({ note, startTime: currentTime, endTime: 0, velocity });
+                        } else {
+                            // velocity=0 はノートオフ
+                            for (let n = notes.length - 1; n >= 0; n--) {
+                                if (notes[n].note === note && notes[n].endTime === 0) {
+                                    notes[n].endTime = currentTime;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if ((status & 0xF0) === 0x80) { // ノートオフ
+                        const note = buffer[offset++];
+                        const velocity = buffer[offset++];
+                        // 対応するノートオンを探す
+                        for (let n = notes.length - 1; n >= 0; n--) {
+                            if (notes[n].note === note && notes[n].endTime === 0) {
+                                notes[n].endTime = currentTime;
+                                break;
+                            }
+                        }
+                    } else if (status === 0xFF) { // メタイベント
+                        const type = buffer[offset++];
+                        const lenResult = readVarLen(buffer, offset);
+                        offset += lenResult.value + lenResult.bytes;
+                    } else {
+                        // その他のMIDIイベントをスキップ
+                        const eventType = status >> 4;
+                        let dataBytes = 0;
+                        if (eventType === 0x8 || eventType === 0x9 || eventType === 0xA || eventType === 0xB || eventType === 0xE) {
+                            dataBytes = 2;
+                        } else if (eventType === 0xC || eventType === 0xD) {
+                            dataBytes = 1;
+                        }
+                        offset += dataBytes;
+                    }
+                }
+
+                // トラックendでendTime未設定のノートをトラックendに設定
+                notes.forEach(note => {
+                    if (note.endTime === 0) {
+                        note.endTime = currentTime;
+                    }
+                });
+
+                // タイム変換（簡易）
+                const ticksPerBeat = division & 0x7FFF;
+                const msPerTick = 500000 / ticksPerBeat / 1000; // テンポ120
+                notes.forEach(note => {
+                    note.startTime = Math.round(note.startTime * msPerTick);
+                    note.endTime = Math.round(note.endTime * msPerTick);
+                });
+                
+                // 和音を複数パートに分割
+                const parts = separateChords(notes);
+
+                tracks.push({ parts, totalTime: Math.round(currentTime * msPerTick) });
+            }
+
+            return { format, trackCount, division, tracks };
+        }
+
+        // MIDIファイルを読み込み
+        function loadMidi() {
+            const fileInput = document.getElementById('midiFile');
+            const file = fileInput.files[0];
+            if (!file) {
+                alert('Please select a MIDI file');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const buffer = new Uint8Array(e.target.result);
+                    midiData = parseMidi(buffer);
+                    populateTrackSelect();
+                    document.getElementById('trackSelect').style.display = 'block';
+                } catch (error) {
+                    alert('Failed to parse MIDI file: ' + error.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        // トラック選択をポピュレート
+        function populateTrackSelect() {
+            const select = document.getElementById('track');
+            select.innerHTML = '';
+            midiData.tracks.forEach((track, index) => {
+                const option = document.createElement('option');
+                option.value = index;
+                const totalNotes = track.parts.reduce((sum, part) => sum + part.length, 0);
+                option.textContent = `Track ${index}: ${track.parts.length} parts, ${totalNotes} notes, total time ${track.totalTime} ms`;
+                select.appendChild(option);
+            });
+        }
+
+        // トラックをプレビュー
+        function previewTrack() {
+            const trackIndex = document.getElementById('track').value;
+            const track = midiData.tracks[trackIndex];
+            let output = `Preview of Track ${trackIndex}:\n`;
+            track.parts.forEach((part, partIdx) => {
+                output += `\n--- Part ${partIdx} ---\n`;
+                part.forEach(note => {
+                    const freq = Math.round(midiNoteToFrequency(note.note));
+                    const vol = Math.round(note.velocity * 100 / 127);
+                    const duration = note.endTime - note.startTime;
+                    output += `Frequency: ${freq} Hz, Volume: ${vol}, Duration: ${duration} ms\n`;
+                });
+            });
+            document.getElementById('output').value = output;
+        }
+
+        // トラックを再生
+        function playTrack() {
+            initAudio();
+            audioContext.resume().catch(err => console.warn('AudioContext resume failed', err));
+            const trackIndex = document.getElementById('track').value;
+            const track = midiData.tracks[trackIndex];
+            let startTime = audioContext.currentTime;
+
+            track.parts.forEach(part => {
+                part.forEach(note => {
+                    const freq = midiNoteToFrequency(note.note);
+                    const vol = note.velocity / 127;
+                    const duration = (note.endTime - note.startTime) / 1000; // ms to s
+                    if (duration <= 0) return;
+                    const noteStart = startTime + note.startTime / 1000;
+
+                    // Oscillator作成
+                    const oscillator = audioContext.createOscillator();
+                    const gainNode = audioContext.createGain();
+
+                    oscillator.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+
+                    oscillator.frequency.setValueAtTime(freq, noteStart);
+                    oscillator.type = 'sine'; // シンプルなトーン
+
+                    gainNode.gain.setValueAtTime(vol * 0.1, noteStart); // 音量調整
+                    gainNode.gain.setValueAtTime(0, noteStart + duration);
+
+                    oscillator.start(noteStart);
+                    oscillator.stop(noteStart + duration);
+                });
+            });
+        }
+    </script>
+</body>
+</html>
